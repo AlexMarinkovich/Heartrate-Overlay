@@ -227,5 +227,4 @@ if __name__ == "__main__":
     window.overlay_connecting = window.create_dot_icon("orange")
     window.overlay_connected = window.create_dot_icon("red")
 
-
     sys.exit(app.exec_())
