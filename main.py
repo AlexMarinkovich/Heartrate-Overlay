@@ -8,8 +8,22 @@ import os
 from device_finder import BleScanWorker
 from hr_worker import HRRecorderWorker
 from video_render_worker import VideoRenderWorker
+from custom_slider import QRangeSlider
 
-MAX_LINES = 100  # max stored lines in console
+MAX_LINES = 200  # max stored lines in console
+
+def ensure_file_exists(file_path: str):
+    """Ensures the file exists. If it doesn't, creates an empty file. Assumes the directory already exists."""
+    if not os.path.exists(file_path):
+        with open(file_path, "a"):
+            pass
+
+# Ensure the folders needed exist
+os.makedirs("heartrate_overlay/logs", exist_ok=True)
+os.makedirs("heartrate_overlay/videos", exist_ok=True)
+os.makedirs("heartrate_overlay/config", exist_ok=True)
+ensure_file_exists("heartrate_overlay/config/color_intervals.txt")
+ensure_file_exists("heartrate_overlay/config/device_address.txt")
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -54,6 +68,20 @@ class MainWindow(QWidget):
         button_layout.addWidget(self.button_one)
         self.is_recording = False
         keyboard.add_hotkey("f7", self.toggle_recording)
+
+        interval_1, interval_2 = self.load_color_intervals()
+        self.range_slider = QRangeSlider(
+            minimum=70,
+            maximum=150,
+            initial_low=interval_1,
+            initial_high=interval_2,
+            left_color=QColor(93, 251, 8),
+            middle_color=QColor(250, 186, 9),
+            right_color=QColor(249, 35, 4),
+        )
+        self.range_slider.setFixedWidth(BUTTON_WIDTH)
+        self.range_slider.rangeChanged.connect(self.save_color_intervals)
+        button_layout.addWidget(self.range_slider)
 
         self.button_two = QPushButton("Generate Video")
         self.button_two.setFixedSize(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -136,7 +164,7 @@ class MainWindow(QWidget):
         self.button_one.setText("Stop Recording (F7)")
         self.is_recording = True
 
-        self.taskbar_button.setOverlayIcon(self.overlay_connecting)
+        self.taskbar_button.setOverlayIcon(self.overlay_dot_connecting)
         
         self.hr_worker = HRRecorderWorker(address)
         self.hr_worker.log.connect(self.announce)
@@ -145,8 +173,8 @@ class MainWindow(QWidget):
         self.hr_worker.start()
 
     def on_hr_connected(self):
-        self.taskbar_button.setOverlayIcon(self.overlay_connected)
-    
+        self.taskbar_button.setOverlayIcon(self.overlay_dot_recording)
+        
     def stop_recording(self):
         if self.hr_worker:
             self.announce("■ Stopping recording...")
@@ -174,7 +202,10 @@ class MainWindow(QWidget):
         self.announce(f"Starting render:\n{file_path}")
         self.button_two.setEnabled(False)
 
-        self.render_worker = VideoRenderWorker(file_path)
+        hr_interval_1 = self.range_slider.low
+        hr_interval_2 = self.range_slider.high
+
+        self.render_worker = VideoRenderWorker(file_path, hr_interval_1, hr_interval_2)
 
         self.render_worker.started.connect(
             lambda p: self.announce("Rendering started...")
@@ -184,19 +215,21 @@ class MainWindow(QWidget):
         self.render_worker.error.connect(self.on_render_error)
 
         self.render_worker.start()
+
+        self.taskbar_button.setOverlayIcon(self.overlay_dot_rendering)
     
     def on_render_finished(self, output_path: str):
         self.announce(f"Render saved to {output_path}")
         self.button_two.setEnabled(True)
+        self.taskbar_button.clearOverlayIcon()
 
     def on_render_error(self, message: str):
         self.announce(f"Render failed:\n{message}")
         self.button_two.setEnabled(True)
+        self.taskbar_button.clearOverlayIcon()
 
     def open_folder(self, relative_path: str):
         path = os.path.abspath(relative_path)
-        os.makedirs(path, exist_ok=True)
-
         try:
             os.startfile(path)
         except Exception as e:
@@ -214,7 +247,22 @@ class MainWindow(QWidget):
         painter.end()
 
         return QIcon(pixmap)
+    
+    def load_color_intervals(self):
+        try:
+            with open("heartrate_overlay/config/color_intervals.txt", "r") as f:
+                lines = f.read().splitlines()
+                if len(lines) >= 2:
+                    return int(lines[0]), int(lines[1])
+        except Exception:
+            pass
 
+        # fallback if file missing or invalid
+        return 0, 150
+
+    def save_color_intervals(self, low, high):
+        with open("heartrate_overlay/config/color_intervals.txt", "w") as f:
+            f.write(f"{low}\n{high}\n")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
@@ -224,7 +272,8 @@ if __name__ == "__main__":
     # Taskbar Icon - must be AFTER window.show()
     window.taskbar_button = QWinTaskbarButton()
     window.taskbar_button.setWindow(window.windowHandle())
-    window.overlay_connecting = window.create_dot_icon("orange")
-    window.overlay_connected = window.create_dot_icon("red")
+    window.overlay_dot_connecting = window.create_dot_icon("orange")
+    window.overlay_dot_recording = window.create_dot_icon("red")
+    window.overlay_dot_rendering = window.create_dot_icon("magenta")
 
     sys.exit(app.exec_())

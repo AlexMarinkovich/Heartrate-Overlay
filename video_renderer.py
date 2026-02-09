@@ -1,5 +1,4 @@
 import av
-import os
 import math
 import numpy as np
 import pandas as pd
@@ -47,11 +46,10 @@ MIN_HR = 40
 FONT_PATH = "heartrate_overlay/assets/Fredoka-Bold.ttf"
 HEART_IMAGE_PATH = "heartrate_overlay/assets/heart.png"
 
-
 # ============================================================
 # PUBLIC ENTRY POINT
 # ============================================================
-def render_video(input_csv: str) -> str:
+def render_video(input_csv: str, hr_interval_1, hr_interval_2) -> str:
     input_csv = Path(input_csv)
 
     output_dir = Path("heartrate_overlay/videos")
@@ -65,37 +63,30 @@ def render_video(input_csv: str) -> str:
     df = pd.read_csv(input_csv)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-    duration_seconds = len(df)
+    hr_array = df["heart_rate"].clip(lower=MIN_HR).to_numpy(dtype=np.int16)
+
+    duration_seconds = len(hr_array)
     total_frames = int(duration_seconds * FPS)
     dt = 1.0 / FPS
 
     heart_img = Image.open(HEART_IMAGE_PATH).convert("RGBA")
-    heart_img = heart_img.resize((HEART_SIZE, HEART_SIZE), Image.LANCZOS)
-
     font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
 
     # ========================================================
     # HELPERS
     # ========================================================
-    def get_hr_at_time(t):
-        index = min(int(t), len(df) - 1)
-        return max(MIN_HR, int(df["heart_rate"].iloc[index]))
-
     def hr_to_color(hr):
-        if hr <= 79:
+        if hr < hr_interval_1:
             return (93, 251, 8)
-        if hr <= 89:
+        if hr < hr_interval_2:
             return (250, 186, 9)
         return (249, 35, 4)
 
     def draw_rounded_line(draw, p1, p2, width, color):
         draw.line([p1, p2], fill=color, width=width)
-        radius = width // 2 - 1
+        r = width // 2 - 1
         for x, y in (p1, p2):
-            draw.ellipse(
-                (x - radius, y - radius, x + radius, y + radius),
-                fill=color
-            )
+            draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
 
     # ========================================================
     # TRAPEZOID MASK
@@ -108,17 +99,66 @@ def render_video(input_csv: str) -> str:
         bottom = HEIGHT - PADDING + (LINE_WIDTH // 2)
         right = WIDTH - PADDING
 
-        polygon = [
-            (0, top),
-            (right, top),
-            (right - SLANT, bottom),
-            (0, bottom)
-        ]
-
-        draw.polygon(polygon, fill=255)
+        draw.polygon(
+            [(0, top), (right, top), (right - SLANT, bottom), (0, bottom)],
+            fill=255
+        )
         return mask
 
     trapezoid_mask = create_trapezoid_mask()
+
+    # ========================================================
+    # STATIC BACKGROUND + BORDER (CACHED)
+    # ========================================================
+    alpha = trapezoid_mask.point(lambda a: a * BG_ALPHA // 255)
+    static_bg = Image.new("RGBA", (WIDTH, HEIGHT), BG_COLOR + (0,))
+    static_bg.putalpha(alpha)
+
+    frame_base = static_bg.copy()
+    base_draw = ImageDraw.Draw(frame_base)
+
+    top = PADDING - (LINE_WIDTH // 2)
+    bottom = HEIGHT - PADDING + (LINE_WIDTH // 2)
+    right = WIDTH - PADDING
+
+    draw_rounded_line(base_draw, (0, top), (right, top), LINE_WIDTH, LINE_COLOR)
+    draw_rounded_line(base_draw, (right, top), (right - SLANT, bottom), LINE_WIDTH, LINE_COLOR)
+    draw_rounded_line(base_draw, (0, bottom), (right - SLANT, bottom), LINE_WIDTH, LINE_COLOR)
+
+    # ========================================================
+    # HEART SCALE CACHE
+    # ========================================================
+    SCALE_STEPS = 64
+    heart_cache = {}
+
+    for i in range(SCALE_STEPS):
+        scale = 1.0 + BEAT_SCALE * (i / (SCALE_STEPS - 1))
+        size = int(HEART_SIZE * scale)
+        heart_cache[i] = heart_img.resize((size, size), Image.LANCZOS)
+
+    def get_cached_heart(scale):
+        idx = int((scale - 1.0) / BEAT_SCALE * (SCALE_STEPS - 1))
+        idx = max(0, min(SCALE_STEPS - 1, idx))
+        return heart_cache[idx]
+
+    # ========================================================
+    # TEXT CACHE
+    # ========================================================
+    text_cache = {}
+
+    def get_text_image(hr):
+        if hr not in text_cache:
+            img = Image.new("RGBA", (200, HEIGHT), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.text(
+                (0, HEIGHT // 2),
+                str(hr),
+                font=font,
+                fill=hr_to_color(hr),
+                anchor=TEXT_ANCHOR
+            )
+            text_cache[hr] = img
+        return text_cache[hr]
 
     # ========================================================
     # HEARTBEAT ENGINE (STATEFUL)
@@ -142,7 +182,6 @@ def render_video(input_csv: str) -> str:
         if beat_phase < LUB_RISE_END:
             x = beat_phase / LUB_RISE_END
             pulse += math.sin(x * math.pi * 0.5)
-
         elif beat_phase < LUB_DECAY_END:
             x = (beat_phase - LUB_RISE_END) / (LUB_DECAY_END - LUB_RISE_END)
             pulse += math.exp(-LUB_DECAY_STRENGTH * x)
@@ -156,42 +195,20 @@ def render_video(input_csv: str) -> str:
     # ========================================================
     # FRAME RENDER
     # ========================================================
-    def make_frame(t):
-        hr = get_hr_at_time(t)
-        text_color = hr_to_color(hr)
+    def make_frame(frame_idx):
+        hr = hr_array[min(frame_idx // FPS, len(hr_array) - 1)]
 
-        base = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-
-        bg = Image.new("RGBA", (WIDTH, HEIGHT), BG_COLOR + (0,))
-        alpha = trapezoid_mask.point(lambda a: a * BG_ALPHA // 255)
-        bg.putalpha(alpha)
-
-        img = Image.alpha_composite(base, bg)
-        draw = ImageDraw.Draw(img)
+        img = frame_base.copy()
 
         scale = heartbeat_scale(dt, hr)
-        size = int(HEART_SIZE * scale)
-        heart = heart_img.resize((size, size), Image.LANCZOS)
+        heart = get_cached_heart(scale)
 
-        hx = HEART_X_CENTER - size // 2
-        hy = (HEIGHT - size) // 2
+        hx = HEART_X_CENTER - heart.width // 2
+        hy = (HEIGHT - heart.height) // 2
         img.paste(heart, (hx, hy), heart)
 
-        draw.text(
-            (HEART_SIZE + TEXT_X_OFFSET, HEIGHT // 2),
-            str(hr),
-            font=font,
-            fill=text_color,
-            anchor=TEXT_ANCHOR
-        )
-
-        top = PADDING - (LINE_WIDTH // 2)
-        bottom = HEIGHT - PADDING + (LINE_WIDTH // 2)
-        right = WIDTH - PADDING
-
-        draw_rounded_line(draw, (0, top), (right, top), LINE_WIDTH, LINE_COLOR)
-        draw_rounded_line(draw, (right, top), (right - SLANT, bottom), LINE_WIDTH, LINE_COLOR)
-        draw_rounded_line(draw, (0, bottom), (right - SLANT, bottom), LINE_WIDTH, LINE_COLOR)
+        text_img = get_text_image(hr)
+        img.alpha_composite(text_img, (HEART_SIZE + TEXT_X_OFFSET, 0))
 
         return np.asarray(img, dtype=np.uint8)
 
@@ -210,7 +227,7 @@ def render_video(input_csv: str) -> str:
     }
 
     for i in range(total_frames):
-        frame = make_frame(i * dt)
+        frame = make_frame(i)
         video_frame = av.VideoFrame.from_ndarray(frame, format="rgba")
         video_frame = video_frame.reformat(
             width=WIDTH,
@@ -225,5 +242,4 @@ def render_video(input_csv: str) -> str:
         container.mux(packet)
 
     container.close()
-
     return str(output_file)

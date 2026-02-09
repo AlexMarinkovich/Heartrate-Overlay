@@ -1,5 +1,6 @@
 venv
 __pycache__
+heartrate_overlay/config
 heartrate_overlay/logs
 heartrate_overlay/videos
 old_stuff
